@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from typing import Optional
+from typing import List, Optional
 
 from app.config import Settings
 from app.models import Candle
@@ -11,6 +11,14 @@ from app.services.signal_engine import SignalEngine
 from app.services.webhook import WebhookSender
 from app.state import MarketState
 from app.ws_manager import WebSocketManager
+
+
+def _current_period_start(timeframe: str) -> int:
+    """Return the unix timestamp where the current (incomplete) candle started."""
+    now = int(time.time())
+    seconds = {"1m": 60, "5m": 300, "15m": 900}
+    period = seconds.get(timeframe, 60)
+    return (now // period) * period
 
 
 class MarketScanner:
@@ -31,7 +39,10 @@ class MarketScanner:
 
         self._task: Optional[asyncio.Task] = None
         self._stop_event = asyncio.Event()
-        self._next_due: dict[str, float] = {}
+
+        # 5m/15m incremental queue: symbols remaining to scan this cycle
+        self._sub_queue: dict[str, List[str]] = {}
+        self._sub_next_due: dict[str, float] = {}
 
     def start(self) -> None:
         if self._task is None or self._task.done():
@@ -55,29 +66,51 @@ class MarketScanner:
             if self.settings.bootstrap_on_start:
                 await self.bootstrap_all()
 
+            # Initialize sub-timeframe queues (5m, 15m)
             now = time.time()
-            self._next_due = {
-                tf: now + self.settings.scan_seconds_for(tf)
-                for tf in self.settings.timeframe_list
-            }
+            for tf in self.settings.timeframe_list:
+                if tf == "1m":
+                    continue
+                self._sub_queue[tf] = []
+                self._sub_next_due[tf] = now  # due immediately for first run
 
             await self.state.set_phase("scheduled_scanning")
 
             while not self._stop_event.is_set():
-                now = time.time()
-                due_timeframes = [
-                    tf for tf in self.settings.timeframe_list
-                    if now >= self._next_due.get(tf, now)
-                ]
+                cycle_start = time.time()
+                deadline = cycle_start + self.settings.scan_seconds_for("1m")  # 60s
 
-                for tf in due_timeframes:
-                    await self.scan_timeframe(tf, full_bootstrap=False)
-                    self._next_due[tf] = time.time() + self.settings.scan_seconds_for(tf)
+                # ── Phase 1: 1m scan (priority, all symbols) ──
+                await self._scan_all_symbols("1m")
 
-                try:
-                    await asyncio.wait_for(self._stop_event.wait(), timeout=1.0)
-                except asyncio.TimeoutError:
-                    pass
+                # ── Phase 2: fill remaining time with 5m/15m ──
+                for tf in ["5m", "15m"]:
+                    if tf not in self._sub_queue:
+                        continue
+
+                    # Refill queue when it's time for a new scan cycle
+                    now = time.time()
+                    if now >= self._sub_next_due[tf] and not self._sub_queue[tf]:
+                        self._sub_queue[tf] = list(self.state.symbols)
+                        self._sub_next_due[tf] = now + self.settings.scan_seconds_for(tf)
+
+                    # Process as many symbols as possible before deadline
+                    while self._sub_queue[tf] and time.time() < deadline - 0.5:
+                        if self._stop_event.is_set():
+                            break
+                        symbol = self._sub_queue[tf].pop(0)
+                        await self._scan_symbol_timeframe(
+                            symbol, tf,
+                            fetch_limit=self.settings.incremental_candle_limit,
+                        )
+
+                # ── Wait until next 1m cycle ──
+                remaining = deadline - time.time()
+                if remaining > 0:
+                    try:
+                        await asyncio.wait_for(self._stop_event.wait(), timeout=remaining)
+                    except asyncio.TimeoutError:
+                        pass
 
         except asyncio.CancelledError:
             return
@@ -86,15 +119,15 @@ class MarketScanner:
 
     async def bootstrap_all(self) -> None:
         await self.state.set_phase("bootstrap_full_candles")
-
         for timeframe in self.settings.timeframe_list:
             await self.scan_timeframe(timeframe, full_bootstrap=True)
 
     async def scan_once(self) -> None:
         for timeframe in self.settings.timeframe_list:
-            await self.scan_timeframe(timeframe, full_bootstrap=False)
+            await self._scan_all_symbols(timeframe)
 
     async def scan_timeframe(self, timeframe: str, full_bootstrap: bool = False) -> None:
+        """Full scan of a timeframe (used for bootstrap and manual triggers)."""
         started_at = int(time.time())
 
         async with self.state.lock:
@@ -117,10 +150,7 @@ class MarketScanner:
             for idx, symbol in enumerate(symbols, start=1):
                 if self._stop_event.is_set():
                     break
-
                 await self._scan_symbol_timeframe(symbol, timeframe, fetch_limit=limit)
-
-                # 상태 표시용. 너무 자주 lock을 잡지 않도록 25개마다만 업데이트.
                 if idx % 25 == 0:
                     await self.state.set_phase(f"scan_{timeframe}_{idx}/{len(symbols)}")
 
@@ -137,12 +167,43 @@ class MarketScanner:
             fetch_limit=force_limit or self.settings.candle_limit_for(timeframe),
         )
 
+    async def _scan_all_symbols(self, timeframe: str) -> None:
+        """Incremental scan of all symbols for one timeframe."""
+        symbols = list(self.state.symbols)
+        if not symbols:
+            return
+
+        async with self.state.lock:
+            self.state.scanner_running = True
+            self.state.last_scan_started_at = int(time.time())
+            self.state.current_phase = f"scan_{timeframe}"
+
+        try:
+            limit = self.settings.incremental_candle_limit
+            for idx, symbol in enumerate(symbols, start=1):
+                if self._stop_event.is_set():
+                    break
+                await self._scan_symbol_timeframe(symbol, timeframe, fetch_limit=limit)
+                if idx % 25 == 0:
+                    await self.state.set_phase(f"scan_{timeframe}_{idx}/{len(symbols)}")
+        finally:
+            async with self.state.lock:
+                self.state.scanner_running = False
+                self.state.last_scan_finished_at = int(time.time())
+                self.state.current_phase = "idle"
+
     async def _scan_symbol_timeframe(self, symbol: str, timeframe: str, fetch_limit: int) -> None:
         try:
             previous = await self.state.get_candles(symbol, timeframe, limit=1)
             previous_last = previous[-1] if previous else None
 
             new_candles = await self.futures_client.fetch_candles(symbol, timeframe, fetch_limit)
+            if not new_candles:
+                return
+
+            # ── Filter out incomplete (current) candle ──
+            cutoff = _current_period_start(timeframe)
+            new_candles = [c for c in new_candles if c.time < cutoff]
             if not new_candles:
                 return
 
