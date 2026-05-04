@@ -103,8 +103,9 @@ class MarketState:
     async def snapshot_status(self) -> dict:
         async with self.lock:
             n = len(self.symbols)
-            per_symbol_rate = sum(1 / max(1, self.settings.scan_seconds_for(tf)) for tf in self.settings.timeframe_list)
-            estimated_rps = n * per_symbol_rate
+            # 1 API call per symbol per scan cycle (only 1m fetched, rest derived)
+            scan_interval = self.settings.scan_interval_seconds
+            estimated_rps = n / max(1, scan_interval)
 
             return {
                 "ok": True,
