@@ -37,8 +37,13 @@ class WebSocketManager:
         payload = {"event": "signal", "data": signal.model_dump()}
         async with self._lock:
             clients = list(self.signal_clients)
+            # Also notify candle clients watching this symbol/timeframe
+            candle_watchers = list(
+                self.candle_clients.get((signal.symbol, signal.timeframe), set())
+            )
 
         await self._safe_broadcast(clients, payload)
+        await self._safe_broadcast(candle_watchers, payload)
 
     async def broadcast_candle(self, symbol: str, timeframe: str, candle: Candle) -> None:
         payload = {
