@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import time
-from typing import List, Optional
+from typing import Optional
 
 from app.config import Settings
 from app.models import Candle
+from app.services.aggregator import DERIVED_TIMEFRAMES, TIMEFRAME_SECONDS, aggregate_candles
 from app.services.futures_client import GateFuturesClient
 from app.services.signal_engine import SignalEngine
 from app.services.webhook import WebhookSender
@@ -14,10 +15,9 @@ from app.ws_manager import WebSocketManager
 
 
 def _current_period_start(timeframe: str) -> int:
-    """Return the unix timestamp where the current (incomplete) candle started."""
+    """Unix timestamp where the current (incomplete) candle started."""
     now = int(time.time())
-    seconds = {"1m": 60, "5m": 300, "15m": 900}
-    period = seconds.get(timeframe, 60)
+    period = TIMEFRAME_SECONDS.get(timeframe, 60)
     return (now // period) * period
 
 
@@ -40,10 +40,6 @@ class MarketScanner:
         self._task: Optional[asyncio.Task] = None
         self._stop_event = asyncio.Event()
 
-        # 5m/15m incremental queue: symbols remaining to scan this cycle
-        self._sub_queue: dict[str, List[str]] = {}
-        self._sub_next_due: dict[str, float] = {}
-
     def start(self) -> None:
         if self._task is None or self._task.done():
             self._task = asyncio.create_task(self.run())
@@ -57,6 +53,8 @@ class MarketScanner:
             except BaseException:
                 pass
 
+    # ── Main loop ──────────────────────────────────────────────
+
     async def run(self) -> None:
         try:
             await self.state.set_phase("loading_symbols")
@@ -64,111 +62,43 @@ class MarketScanner:
             await self.state.set_symbols(symbols)
 
             if self.settings.bootstrap_on_start:
-                await self.bootstrap_all()
-
-            # Initialize sub-timeframe queues (5m, 15m)
-            now = time.time()
-            for tf in self.settings.timeframe_list:
-                if tf == "1m":
-                    continue
-                self._sub_queue[tf] = []
-                self._sub_next_due[tf] = now  # due immediately for first run
+                await self._bootstrap()
 
             await self.state.set_phase("scheduled_scanning")
 
             while not self._stop_event.is_set():
-                cycle_start = time.time()
-                deadline = cycle_start + self.settings.scan_seconds_for("1m")  # 60s
+                await self._scan_all()
 
-                # ── Phase 1: 1m scan (priority, all symbols) ──
-                await self._scan_all_symbols("1m")
-
-                # ── Phase 2: fill remaining time with 5m/15m ──
-                for tf in ["5m", "15m"]:
-                    if tf not in self._sub_queue:
-                        continue
-
-                    # Refill queue when it's time for a new scan cycle
-                    now = time.time()
-                    if now >= self._sub_next_due[tf] and not self._sub_queue[tf]:
-                        self._sub_queue[tf] = list(self.state.symbols)
-                        self._sub_next_due[tf] = now + self.settings.scan_seconds_for(tf)
-
-                    # Process as many symbols as possible before deadline
-                    while self._sub_queue[tf] and time.time() < deadline - 0.5:
-                        if self._stop_event.is_set():
-                            break
-                        symbol = self._sub_queue[tf].pop(0)
-                        await self._scan_symbol_timeframe(
-                            symbol, tf,
-                            fetch_limit=self.settings.incremental_candle_limit,
-                        )
-
-                # ── Wait until next 1m cycle ──
-                remaining = deadline - time.time()
-                if remaining > 0:
-                    try:
-                        await asyncio.wait_for(self._stop_event.wait(), timeout=remaining)
-                    except asyncio.TimeoutError:
-                        pass
+                # 1초 휴식 후 바로 다음 사이클
+                try:
+                    await asyncio.wait_for(self._stop_event.wait(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    pass
 
         except asyncio.CancelledError:
             return
         except Exception as e:
             await self.state.add_error(f"scanner fatal error: {type(e).__name__}: {e}")
 
-    async def bootstrap_all(self) -> None:
-        await self.state.set_phase("bootstrap_full_candles")
-        for timeframe in self.settings.timeframe_list:
-            await self.scan_timeframe(timeframe, full_bootstrap=True)
+    # ── Bootstrap ──────────────────────────────────────────────
 
-    async def scan_once(self) -> None:
-        for timeframe in self.settings.timeframe_list:
-            await self._scan_all_symbols(timeframe)
+    async def _bootstrap(self) -> None:
+        """Fetch full 2000 1m candles per symbol, then derive all timeframes."""
+        await self.state.set_phase("bootstrap")
+        symbols = list(self.state.symbols)
+        bootstrap_limit = self.settings.candle_limit_for("1m")  # 2000
 
-    async def scan_timeframe(self, timeframe: str, full_bootstrap: bool = False) -> None:
-        """Full scan of a timeframe (used for bootstrap and manual triggers)."""
-        started_at = int(time.time())
+        for idx, symbol in enumerate(symbols, start=1):
+            if self._stop_event.is_set():
+                break
+            await self._scan_symbol(symbol, fetch_limit=bootstrap_limit)
+            if idx % 25 == 0:
+                await self.state.set_phase(f"bootstrap_{idx}/{len(symbols)}")
 
-        async with self.state.lock:
-            self.state.scanner_running = True
-            self.state.last_scan_started_at = started_at
-            self.state.current_phase = f"scan_{timeframe}"
+    # ── Incremental scan ───────────────────────────────────────
 
-        try:
-            symbols = list(self.state.symbols)
-            if not symbols:
-                symbols = await self.futures_client.list_symbols()
-                await self.state.set_symbols(symbols)
-
-            limit = (
-                self.settings.candle_limit_for(timeframe)
-                if full_bootstrap
-                else self.settings.incremental_candle_limit
-            )
-
-            for idx, symbol in enumerate(symbols, start=1):
-                if self._stop_event.is_set():
-                    break
-                await self._scan_symbol_timeframe(symbol, timeframe, fetch_limit=limit)
-                if idx % 25 == 0:
-                    await self.state.set_phase(f"scan_{timeframe}_{idx}/{len(symbols)}")
-
-        finally:
-            async with self.state.lock:
-                self.state.scanner_running = False
-                self.state.last_scan_finished_at = int(time.time())
-                self.state.current_phase = "idle"
-
-    async def fetch_symbol_timeframe(self, symbol: str, timeframe: str, force_limit: Optional[int] = None) -> None:
-        await self._scan_symbol_timeframe(
-            symbol.upper(),
-            timeframe,
-            fetch_limit=force_limit or self.settings.candle_limit_for(timeframe),
-        )
-
-    async def _scan_all_symbols(self, timeframe: str) -> None:
-        """Incremental scan of all symbols for one timeframe."""
+    async def _scan_all(self) -> None:
+        """Incremental scan: fetch recent 1m candles, re-derive all timeframes."""
         symbols = list(self.state.symbols)
         if not symbols:
             return
@@ -176,60 +106,110 @@ class MarketScanner:
         async with self.state.lock:
             self.state.scanner_running = True
             self.state.last_scan_started_at = int(time.time())
-            self.state.current_phase = f"scan_{timeframe}"
+            self.state.current_phase = "scan_1m"
 
         try:
             limit = self.settings.incremental_candle_limit
             for idx, symbol in enumerate(symbols, start=1):
                 if self._stop_event.is_set():
                     break
-                await self._scan_symbol_timeframe(symbol, timeframe, fetch_limit=limit)
+                await self._scan_symbol(symbol, fetch_limit=limit)
                 if idx % 25 == 0:
-                    await self.state.set_phase(f"scan_{timeframe}_{idx}/{len(symbols)}")
+                    await self.state.set_phase(f"scan_1m_{idx}/{len(symbols)}")
         finally:
             async with self.state.lock:
                 self.state.scanner_running = False
                 self.state.last_scan_finished_at = int(time.time())
                 self.state.current_phase = "idle"
 
-    async def _scan_symbol_timeframe(self, symbol: str, timeframe: str, fetch_limit: int) -> None:
-        try:
-            previous = await self.state.get_candles(symbol, timeframe, limit=1)
-            previous_last = previous[-1] if previous else None
+    # ── Per-symbol work ────────────────────────────────────────
 
-            new_candles = await self.futures_client.fetch_candles(symbol, timeframe, fetch_limit)
+    async def _scan_symbol(self, symbol: str, fetch_limit: int) -> None:
+        try:
+            # 1) Fetch 1m candles from Gate API
+            new_candles = await self.futures_client.fetch_candles(symbol, "1m", fetch_limit)
             if not new_candles:
                 return
 
-            # ── Filter out incomplete (current) candle ──
-            cutoff = _current_period_start(timeframe)
+            # 2) Filter out the current incomplete 1m candle
+            cutoff = _current_period_start("1m")
             new_candles = [c for c in new_candles if c.time < cutoff]
             if not new_candles:
                 return
 
-            merged = await self.state.merge_candles(symbol, timeframe, new_candles)
+            # 3) Merge into 1m store & remember previous last candle
+            prev_1m = await self.state.get_candles(symbol, "1m", limit=1)
+            prev_last_1m = prev_1m[-1] if prev_1m else None
 
-            all_signals = self.engine.calculate_signals(symbol, timeframe, merged)
-            await self.state.set_signals_for_symbol_tf(symbol, timeframe, all_signals)
+            merged_1m = await self.state.merge_candles(symbol, "1m", new_candles)
 
-            latest_candle = merged[-1]
-            if self._candle_changed(previous_last, latest_candle):
-                await self.ws_manager.broadcast_candle(symbol, timeframe, latest_candle)
+            # 4) 1m signals
+            signals_1m = self.engine.calculate_signals(symbol, "1m", merged_1m)
+            await self.state.set_signals_for_symbol_tf(symbol, "1m", signals_1m)
 
-            if all_signals:
-                latest_signal = all_signals[-1]
-                added = await self.state.add_recent_signal_if_new(latest_signal)
-                if added:
-                    await self.ws_manager.broadcast_signal(latest_signal)
-                    await self.webhook_sender.send_signal(latest_signal)
+            # 5) Broadcast 1m candle update
+            if merged_1m:
+                latest_1m = merged_1m[-1]
+                if self._candle_changed(prev_last_1m, latest_1m):
+                    await self.ws_manager.broadcast_candle(symbol, "1m", latest_1m)
+
+            # 6) Broadcast new 1m signal
+            if signals_1m:
+                await self._try_broadcast_signal(signals_1m[-1])
+
+            # 7) Derive higher timeframes from 1m data
+            for tf in DERIVED_TIMEFRAMES:
+                period = TIMEFRAME_SECONDS[tf]
+                aggregated = aggregate_candles(merged_1m, period)
+
+                prev_tf = await self.state.get_candles(symbol, tf, limit=1)
+                prev_last_tf = prev_tf[-1] if prev_tf else None
+
+                await self.state.set_candles(symbol, tf, aggregated)
+
+                signals_tf = self.engine.calculate_signals(symbol, tf, aggregated)
+                await self.state.set_signals_for_symbol_tf(symbol, tf, signals_tf)
+
+                # Broadcast derived candle update
+                if aggregated:
+                    latest_tf = aggregated[-1]
+                    if self._candle_changed(prev_last_tf, latest_tf):
+                        await self.ws_manager.broadcast_candle(symbol, tf, latest_tf)
+
+                # Broadcast new derived signal
+                if signals_tf:
+                    await self._try_broadcast_signal(signals_tf[-1])
 
         except Exception as e:
-            await self.state.add_error(f"{symbol} {timeframe}: {type(e).__name__}: {e}")
+            await self.state.add_error(f"{symbol}: {type(e).__name__}: {e}")
+
+    async def _try_broadcast_signal(self, signal) -> None:
+        added = await self.state.add_recent_signal_if_new(signal)
+        if added:
+            await self.ws_manager.broadcast_signal(signal)
+            await self.webhook_sender.send_signal(signal)
+
+    # ── Public helpers (for REST endpoints) ────────────────────
+
+    async def scan_once(self) -> None:
+        await self._scan_all()
+
+    async def scan_timeframe(self, timeframe: str, full_bootstrap: bool = False) -> None:
+        """Manual trigger for a specific timeframe (used by /api/scan/timeframe)."""
+        if timeframe == "1m" or full_bootstrap:
+            await self._bootstrap() if full_bootstrap else await self._scan_all()
+        # Derived timeframes are automatically updated when 1m is scanned
+
+    async def fetch_symbol_timeframe(self, symbol: str, timeframe: str, force_limit: Optional[int] = None) -> None:
+        """On-demand fetch for a single symbol (e.g. when chart is opened)."""
+        limit = force_limit or self.settings.candle_limit_for("1m")
+        await self._scan_symbol(symbol.upper(), fetch_limit=limit)
+
+    # ── Utilities ──────────────────────────────────────────────
 
     def _candle_changed(self, prev: Optional[Candle], current: Candle) -> bool:
         if prev is None:
             return True
-
         return (
             prev.time != current.time
             or prev.open != current.open

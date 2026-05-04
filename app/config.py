@@ -18,10 +18,13 @@ class Settings(BaseSettings):
     use_top_volume: bool = True
     exclude_delisting: bool = True
 
-    timeframes: str = "1m,5m,15m"
-    candle_limits_json: str = '{"1m":300,"5m":100,"15m":60}'
+    # All timeframes served (1m fetched from API, rest derived)
+    timeframes: str = "1m,3m,5m,15m,30m,1h"
+    candle_limits_json: str = '{"1m":2000,"3m":666,"5m":400,"15m":133,"30m":66,"1h":33}'
     incremental_candle_limit: int = 5
-    timeframe_scan_seconds_json: str = '{"1m":60,"5m":300,"15m":900}'
+
+    # Only controls the main 1m scan cycle interval
+    scan_interval_seconds: int = 60
 
     public_rps_limit: float = 12.0
     public_burst: int = 3
@@ -48,15 +51,7 @@ class Settings(BaseSettings):
             data = json.loads(self.candle_limits_json)
             return {str(k): min(int(v), 2000) for k, v in data.items()}
         except Exception:
-            return {"1m": 300, "5m": 100, "15m": 60}
-
-    @property
-    def timeframe_scan_seconds(self) -> Dict[str, int]:
-        try:
-            data = json.loads(self.timeframe_scan_seconds_json)
-            return {str(k): int(v) for k, v in data.items()}
-        except Exception:
-            return {"1m": 60, "5m": 300, "15m": 900}
+            return {"1m": 2000, "3m": 666, "5m": 400, "15m": 133, "30m": 66, "1h": 33}
 
     @property
     def cors_origin_list(self) -> List[str]:
@@ -67,9 +62,6 @@ class Settings(BaseSettings):
 
     def candle_limit_for(self, timeframe: str) -> int:
         return int(self.candle_limits.get(timeframe, 100))
-
-    def scan_seconds_for(self, timeframe: str) -> int:
-        return int(self.timeframe_scan_seconds.get(timeframe, 60))
 
 
 @lru_cache
