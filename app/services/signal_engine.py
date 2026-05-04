@@ -1,162 +1,180 @@
+"""
+UT Bot Alerts — faithful Python port of the TradingView Pine Script.
+
+Original Pine Script by @QuantNomad:
+  - key_value (sensitivity): default 1
+  - atr_period: default 10
+  - ema_period (for trend filter): default 1 (effectively disabled)
+
+Logic:
+  1. xATR = atr(atr_period)
+  2. nLoss = key_value * xATR
+  3. Trailing stop (xATRTrailingStop):
+     - If close > prev_stop AND prev_close > prev_stop:
+         stop = max(prev_stop, close - nLoss)
+     - If close < prev_stop AND prev_close < prev_stop:
+         stop = min(prev_stop, close + nLoss)
+     - If close > prev_stop:
+         stop = close - nLoss
+     - Else:
+         stop = close + nLoss
+  4. Position detection:
+     - pos =  1 if close[1] < prev_stop AND close > stop  (cross above)
+     - pos = -1 if close[1] > prev_stop AND close < stop  (cross below)
+     - else keep previous pos
+  5. Signal:
+     - BUY  when pos == 1 AND prev_pos != 1  (AND close > ema if filter on)
+     - SELL when pos == -1 AND prev_pos != -1 (AND close < ema if filter on)
+"""
 from __future__ import annotations
 
 from typing import List, Optional
 
 from app.models import Candle, Signal
-from app.services.indicators import ema, rsi, sma
+from app.services.indicators import atr, ema
 
 
 class SignalEngine:
-    def __init__(self, min_score: int = 70):
+    def __init__(
+        self,
+        min_score: int = 70,
+        key_value: float = 1.0,
+        atr_period: int = 10,
+        ema_period: int = 1,
+    ):
         self.min_score = min_score
+        self.key_value = key_value
+        self.atr_period = atr_period
+        self.ema_period = ema_period
 
-    def calculate_signals(self, symbol: str, timeframe: str, candles: List[Candle]) -> List[Signal]:
-        if len(candles) < 60:
+    def calculate_signals(
+        self, symbol: str, timeframe: str, candles: List[Candle]
+    ) -> List[Signal]:
+        n = len(candles)
+        if n < self.atr_period + 2:
             return []
 
         closes = [c.close for c in candles]
-        volumes = [c.volume for c in candles]
+        highs = [c.high for c in candles]
+        lows = [c.low for c in candles]
 
-        ema_fast = ema(closes, 20)
-        ema_slow = ema(closes, 50)
-        rsi14 = rsi(closes, 14)
-        vol_sma20 = sma(volumes, 20)
+        # ATR
+        xATR = atr(highs, lows, closes, self.atr_period)
+
+        # EMA filter (period=1 means just the close itself)
+        ema_filter = ema(closes, self.ema_period) if self.ema_period > 1 else closes
+
+        # Trailing stop calculation
+        trail_stop: List[Optional[float]] = [None] * n
+        pos: List[int] = [0] * n  # 1 = long, -1 = short
 
         signals: List[Signal] = []
 
-        for i in range(51, len(candles)):
-            sig = self._signal_at(
-                symbol=symbol,
-                timeframe=timeframe,
-                candles=candles,
-                i=i,
-                ema_fast=ema_fast,
-                ema_slow=ema_slow,
-                rsi14=rsi14,
-                vol_sma20=vol_sma20,
-            )
-            if sig:
-                signals.append(sig)
+        for i in range(1, n):
+            if xATR[i] is None:
+                continue
+
+            nLoss = self.key_value * xATR[i]
+            prev_stop = trail_stop[i - 1]
+
+            # First valid bar
+            if prev_stop is None:
+                trail_stop[i] = closes[i] - nLoss
+                pos[i] = 1 if closes[i] > trail_stop[i] else -1
+                continue
+
+            prev_close = closes[i - 1]
+
+            # Trailing stop logic (matches Pine Script exactly)
+            if closes[i] > prev_stop and prev_close > prev_stop:
+                trail_stop[i] = max(prev_stop, closes[i] - nLoss)
+            elif closes[i] < prev_stop and prev_close < prev_stop:
+                trail_stop[i] = min(prev_stop, closes[i] + nLoss)
+            elif closes[i] > prev_stop:
+                trail_stop[i] = closes[i] - nLoss
+            else:
+                trail_stop[i] = closes[i] + nLoss
+
+            # Position detection
+            if prev_close < prev_stop and closes[i] > trail_stop[i]:
+                pos[i] = 1
+            elif prev_close > prev_stop and closes[i] < trail_stop[i]:
+                pos[i] = -1
+            else:
+                pos[i] = pos[i - 1]
+
+            # Signal generation
+            prev_pos = pos[i - 1]
+
+            # EMA filter value
+            ema_val = ema_filter[i] if isinstance(ema_filter, list) and i < len(ema_filter) and ema_filter[i] is not None else closes[i]
+
+            if pos[i] == 1 and prev_pos != 1:
+                # BUY signal
+                if self.ema_period <= 1 or closes[i] > ema_val:
+                    score = self._score(xATR[i], closes[i], nLoss)
+                    if score >= self.min_score:
+                        c = candles[i]
+                        signals.append(Signal(
+                            id=f"{symbol}:{timeframe}:{c.time}:BUY",
+                            symbol=symbol,
+                            timeframe=timeframe,
+                            time=c.time,
+                            price=c.close,
+                            type="BUY",
+                            score=score,
+                            reason=f"BUY: UT Bot · ATR {xATR[i]:.6g} · Stop {trail_stop[i]:.6g}",
+                            marker_position="belowBar",
+                            marker_shape="arrowUp",
+                        ))
+
+            elif pos[i] == -1 and prev_pos != -1:
+                # SELL signal
+                if self.ema_period <= 1 or closes[i] < ema_val:
+                    score = self._score(xATR[i], closes[i], nLoss)
+                    if score >= self.min_score:
+                        c = candles[i]
+                        signals.append(Signal(
+                            id=f"{symbol}:{timeframe}:{c.time}:SELL",
+                            symbol=symbol,
+                            timeframe=timeframe,
+                            time=c.time,
+                            price=c.close,
+                            type="SELL",
+                            score=score,
+                            reason=f"SELL: UT Bot · ATR {xATR[i]:.6g} · Stop {trail_stop[i]:.6g}",
+                            marker_position="aboveBar",
+                            marker_shape="arrowDown",
+                        ))
 
         return signals
 
-    def _signal_at(
-        self,
-        symbol: str,
-        timeframe: str,
-        candles: List[Candle],
-        i: int,
-        ema_fast: list,
-        ema_slow: list,
-        rsi14: list,
-        vol_sma20: list,
-    ) -> Optional[Signal]:
-        c = candles[i]
-        prev = candles[i - 1]
+    def _score(self, atr_val: float, close: float, nLoss: float) -> int:
+        """
+        Score 0–100 based on how significant the move is relative to ATR.
+        All UT Bot signals are structurally valid, so base score is high.
+        """
+        if close == 0 or atr_val == 0:
+            return 70
 
-        ef = ema_fast[i]
-        es = ema_slow[i]
-        prev_ef = ema_fast[i - 1]
-        prev_es = ema_slow[i - 1]
-        rv = rsi14[i]
-        vavg = vol_sma20[i]
+        # ATR as % of price — larger ATR = more volatile = stronger signal
+        atr_pct = (atr_val / close) * 100
+        score = 70
 
-        if None in (ef, es, prev_ef, prev_es, rv, vavg):
-            return None
+        if atr_pct > 0.5:
+            score += 5
+        if atr_pct > 1.0:
+            score += 5
+        if atr_pct > 2.0:
+            score += 5
+        if atr_pct > 3.0:
+            score += 5
 
-        vol_ratio = c.volume / vavg if vavg and vavg > 0 else 1.0
+        # nLoss distance as confirmation
+        loss_pct = (nLoss / close) * 100
+        if loss_pct > 1.0:
+            score += 5
+        if loss_pct > 2.0:
+            score += 5
 
-        cross_up = prev_ef <= prev_es and ef > es
-        cross_down = prev_ef >= prev_es and ef < es
-
-        bullish_break = (
-            c.close > ef
-            and prev.close <= prev_ef
-            and rv >= 52
-            and vol_ratio >= 1.15
-        )
-
-        bearish_break = (
-            c.close < ef
-            and prev.close >= prev_ef
-            and rv <= 48
-            and vol_ratio >= 1.15
-        )
-
-        if cross_up or bullish_break:
-            score = self._buy_score(c.close, ef, es, rv, vol_ratio, cross_up)
-            if score >= self.min_score:
-                reason = self._reason("BUY", cross_up, bullish_break, rv, vol_ratio)
-                return Signal(
-                    id=f"{symbol}:{timeframe}:{c.time}:BUY",
-                    symbol=symbol,
-                    timeframe=timeframe,
-                    time=c.time,
-                    price=c.close,
-                    type="BUY",
-                    score=score,
-                    reason=reason,
-                    marker_position="belowBar",
-                    marker_shape="arrowUp",
-                )
-
-        if cross_down or bearish_break:
-            score = self._sell_score(c.close, ef, es, rv, vol_ratio, cross_down)
-            if score >= self.min_score:
-                reason = self._reason("SELL", cross_down, bearish_break, rv, vol_ratio)
-                return Signal(
-                    id=f"{symbol}:{timeframe}:{c.time}:SELL",
-                    symbol=symbol,
-                    timeframe=timeframe,
-                    time=c.time,
-                    price=c.close,
-                    type="SELL",
-                    score=score,
-                    reason=reason,
-                    marker_position="aboveBar",
-                    marker_shape="arrowDown",
-                )
-
-        return None
-
-    def _buy_score(self, close: float, ef: float, es: float, rsi_value: float, vol_ratio: float, cross: bool) -> int:
-        score = 50
-        if close > ef:
-            score += 8
-        if ef > es:
-            score += 10
-        if cross:
-            score += 12
-        if 52 <= rsi_value <= 72:
-            score += 12
-        elif rsi_value > 72:
-            score += 4
-        if vol_ratio >= 1.15:
-            score += min(18, int((vol_ratio - 1.0) * 20))
-        return max(0, min(100, score))
-
-    def _sell_score(self, close: float, ef: float, es: float, rsi_value: float, vol_ratio: float, cross: bool) -> int:
-        score = 50
-        if close < ef:
-            score += 8
-        if ef < es:
-            score += 10
-        if cross:
-            score += 12
-        if 28 <= rsi_value <= 48:
-            score += 12
-        elif rsi_value < 28:
-            score += 4
-        if vol_ratio >= 1.15:
-            score += min(18, int((vol_ratio - 1.0) * 20))
-        return max(0, min(100, score))
-
-    def _reason(self, side: str, cross: bool, break_signal: bool, rsi_value: float, vol_ratio: float) -> str:
-        parts = []
-        if cross:
-            parts.append("EMA20/EMA50 cross")
-        if break_signal:
-            parts.append("EMA20 breakout")
-        parts.append(f"RSI {rsi_value:.1f}")
-        parts.append(f"Volume x{vol_ratio:.2f}")
-        return f"{side}: " + " · ".join(parts)
+        return min(100, score)

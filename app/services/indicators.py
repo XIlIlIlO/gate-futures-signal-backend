@@ -69,3 +69,43 @@ def rsi(values: List[float], period: int = 14) -> List[Optional[float]]:
         result[i] = 100.0 if avg_loss == 0 else 100 - (100 / (1 + avg_gain / avg_loss))
 
     return result
+
+
+def true_range(highs: List[float], lows: List[float], closes: List[float]) -> List[float]:
+    """Calculate True Range for each bar (index 0 has no previous close, uses high-low)."""
+    result: List[float] = []
+    for i in range(len(highs)):
+        if i == 0:
+            result.append(highs[i] - lows[i])
+        else:
+            prev_close = closes[i - 1]
+            result.append(max(
+                highs[i] - lows[i],
+                abs(highs[i] - prev_close),
+                abs(lows[i] - prev_close),
+            ))
+    return result
+
+
+def atr(highs: List[float], lows: List[float], closes: List[float], period: int = 10) -> List[Optional[float]]:
+    """
+    Average True Range using RMA (Wilder's smoothing), matching TradingView's ta.atr().
+    RMA = (prev_rma * (period - 1) + current_value) / period
+    """
+    tr = true_range(highs, lows, closes)
+
+    result: List[Optional[float]] = [None] * len(tr)
+    if len(tr) < period:
+        return result
+
+    # Seed with SMA of first `period` TR values
+    seed = sum(tr[:period]) / period
+    result[period - 1] = seed
+
+    prev = seed
+    for i in range(period, len(tr)):
+        current = (prev * (period - 1) + tr[i]) / period
+        result[i] = current
+        prev = current
+
+    return result
