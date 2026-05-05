@@ -153,9 +153,8 @@ class MarketScanner:
                 if self._candle_changed(prev_last_1m, latest_1m):
                     await self.ws_manager.broadcast_candle(symbol, "1m", latest_1m)
 
-            # 6) Broadcast new 1m signal
-            if signals_1m:
-                await self._try_broadcast_signal(signals_1m[-1])
+            # 6) Add 1m signals to recent + broadcast newest
+            await self._collect_signals(signals_1m)
 
             # 7) Derive higher timeframes from 1m data
             for tf in DERIVED_TIMEFRAMES:
@@ -176,18 +175,25 @@ class MarketScanner:
                     if self._candle_changed(prev_last_tf, latest_tf):
                         await self.ws_manager.broadcast_candle(symbol, tf, latest_tf)
 
-                # Broadcast new derived signal
-                if signals_tf:
-                    await self._try_broadcast_signal(signals_tf[-1])
+                # Add derived signals to recent + broadcast newest
+                await self._collect_signals(signals_tf)
 
         except Exception as e:
             await self.state.add_error(f"{symbol}: {type(e).__name__}: {e}")
 
-    async def _try_broadcast_signal(self, signal) -> None:
-        added = await self.state.add_recent_signal_if_new(signal)
+    async def _collect_signals(self, signals: list) -> None:
+        """Add all signals to recent_signals; broadcast + webhook only if the latest is new."""
+        if not signals:
+            return
+        # Store all except the last (historical, no broadcast)
+        for sig in signals[:-1]:
+            await self.state.add_recent_signal_if_new(sig)
+        # Last signal: add + broadcast if new
+        latest = signals[-1]
+        added = await self.state.add_recent_signal_if_new(latest)
         if added:
-            await self.ws_manager.broadcast_signal(signal)
-            await self.webhook_sender.send_signal(signal)
+            await self.ws_manager.broadcast_signal(latest)
+            await self.webhook_sender.send_signal(latest)
 
     # ── Public helpers (for REST endpoints) ────────────────────
 
