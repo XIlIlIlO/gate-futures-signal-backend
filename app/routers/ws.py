@@ -66,6 +66,10 @@ async def ws_candles(
             candles = await state.get_candles(symbol, timeframe, limit=settings.candle_limit_for(timeframe))
 
         signals = await state.get_signals(symbol, timeframe, limit=1000)
+        if candles:
+            start_time = candles[0].time
+            end_time = candles[-1].time
+            signals = [s for s in signals if start_time <= s.time <= end_time]
 
         await websocket.send_json({
             "event": "snapshot",
