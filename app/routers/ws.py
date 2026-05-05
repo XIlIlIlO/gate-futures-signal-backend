@@ -19,11 +19,17 @@ async def ws_signals(websocket: WebSocket):
     await manager.add_signal_client(websocket)
 
     try:
-        recent = await state.get_recent_signals(timeframe="all", limit=500)
+        settings = websocket.app.state.settings
+        all_signals = []
+        for tf in settings.timeframe_list:
+            tf_signals = await state.get_recent_signals(timeframe=tf, limit=400)
+            all_signals.extend(tf_signals)
+        all_signals.sort(key=lambda s: s.time, reverse=True)
+
         await websocket.send_json({
             "event": "snapshot",
             "market": "gate_usdt_perpetual_futures",
-            "data": [s.model_dump() for s in recent],
+            "data": [s.model_dump() for s in all_signals],
         })
 
         while True:
