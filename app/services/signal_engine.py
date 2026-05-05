@@ -55,13 +55,16 @@ class SignalEngine:
         cache = self._cache.get(key)
 
         # Determine where to start trail_stop/pos calculation
-        if cache and cache.candle_count <= n and cache.last_candle_time == candles[cache.candle_count - 1].time if cache.candle_count > 0 else False:
-            # Cache is valid — extend from where we left off
+        cache_valid = False
+        if cache is not None and cache.candle_count > 0 and cache.candle_count <= n:
+            if candles[cache.candle_count - 1].time == cache.last_candle_time:
+                cache_valid = True
+
+        if cache_valid:
             trail_stop = cache.trail_stop
             pos = cache.pos
             start = cache.candle_count
         else:
-            # No cache or invalid — full calculation
             trail_stop = [None] * n
             pos = [0] * n
             start = 1
