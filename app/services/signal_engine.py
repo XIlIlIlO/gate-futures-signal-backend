@@ -1,26 +1,13 @@
 """
-UT Bot Alerts — with trail_stop/pos cache for incremental updates.
-
-Full ATR is recalculated each call (fast with numpy-free RMA).
-Only trail_stop and pos arrays are cached and extended incrementally.
-Signals are always regenerated from the full trail_stop/pos arrays.
+UT Bot Alerts — faithful Python port of the TradingView Pine Script.
+Full calculation every call. ATR + trailing stop is O(n) so fast enough.
 """
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional
 
 from app.models import Candle, Signal
 from app.services.indicators import atr
-
-
-class _CacheEntry:
-    __slots__ = ("candle_count", "last_candle_time", "trail_stop", "pos")
-
-    def __init__(self):
-        self.candle_count: int = 0
-        self.last_candle_time: int = 0
-        self.trail_stop: List[Optional[float]] = []
-        self.pos: List[int] = []
 
 
 class SignalEngine:
@@ -35,7 +22,6 @@ class SignalEngine:
         self.key_value = key_value
         self.atr_period = atr_period
         self.ema_period = ema_period
-        self._cache: Dict[Tuple[str, str], _CacheEntry] = {}
 
     def calculate_signals(
         self, symbol: str, timeframe: str, candles: List[Candle]
@@ -48,35 +34,12 @@ class SignalEngine:
         highs = [c.high for c in candles]
         lows = [c.low for c in candles]
 
-        # ATR is always fully recalculated (fast O(n) with RMA)
         xATR = atr(highs, lows, closes, self.atr_period)
 
-        key = (symbol, timeframe)
-        cache = self._cache.get(key)
+        trail_stop: List[Optional[float]] = [None] * n
+        pos: List[int] = [0] * n
 
-        # Determine where to start trail_stop/pos calculation
-        cache_valid = False
-        if cache is not None and cache.candle_count > 0 and cache.candle_count <= n:
-            if candles[cache.candle_count - 1].time == cache.last_candle_time:
-                cache_valid = True
-
-        if cache_valid:
-            trail_stop = cache.trail_stop
-            pos = cache.pos
-            start = cache.candle_count
-        else:
-            trail_stop = [None] * n
-            pos = [0] * n
-            start = 1
-
-        # Extend arrays if needed
-        while len(trail_stop) < n:
-            trail_stop.append(None)
-        while len(pos) < n:
-            pos.append(0)
-
-        # Calculate trail_stop and pos from start
-        for i in range(start, n):
+        for i in range(1, n):
             if xATR[i] is None:
                 continue
 
@@ -106,15 +69,7 @@ class SignalEngine:
             else:
                 pos[i] = pos[i - 1]
 
-        # Update cache
-        entry = _CacheEntry()
-        entry.candle_count = n
-        entry.last_candle_time = candles[n - 1].time
-        entry.trail_stop = trail_stop
-        entry.pos = pos
-        self._cache[key] = entry
-
-        # Generate signals from full arrays (fast scan)
+        # Generate signals
         signals: List[Signal] = []
         for i in range(1, n):
             if trail_stop[i] is None or xATR[i] is None:
