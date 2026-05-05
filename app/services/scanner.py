@@ -135,19 +135,18 @@ class MarketScanner:
             prev_last_1m = await self._get_last_candle(symbol, "1m")
             merged_1m = await self.state.merge_candles(symbol, "1m", new_candles)
 
-            # 4) 1m signals (cached incrementally in engine)
+            # 4) 1m signals
             signals_1m = self.engine.calculate_signals(symbol, "1m", merged_1m)
 
             # 5) Derive higher timeframes — batch all updates
             derived_updates: List[Tuple[str, List[Candle], List[Signal]]] = []
             broadcast_candles: List[Tuple[str, Candle, Optional[Candle]]] = []
-            all_signals: List[Signal] = list(signals_1m)
+            signals_by_tf: dict = {"1m": signals_1m}
 
             for tf in DERIVED_TIMEFRAMES:
                 period = TIMEFRAME_SECONDS[tf]
                 cache_key = (symbol, tf)
 
-                # Incremental aggregation
                 prev_agg, prev_count = self._agg_cache.get(cache_key, ([], 0))
                 aggregated = aggregate_candles_incremental(
                     prev_agg, merged_1m, period, prev_count,
@@ -156,7 +155,7 @@ class MarketScanner:
 
                 signals_tf = self.engine.calculate_signals(symbol, tf, aggregated)
                 derived_updates.append((tf, aggregated, signals_tf))
-                all_signals.extend(signals_tf)
+                signals_by_tf[tf] = signals_tf
 
                 # Track candle changes for broadcast
                 prev_last_tf = prev_agg[-1] if prev_agg else None
@@ -178,7 +177,7 @@ class MarketScanner:
                     await self.ws_manager.broadcast_candle(symbol, tf, latest)
 
             # 9) Collect all signals — batch add + broadcast newest per tf
-            await self._collect_signals(all_signals)
+            await self._collect_signals(signals_by_tf)
 
         except Exception as e:
             await self.state.add_error(f"{symbol}: {type(e).__name__}: {e}")
@@ -187,18 +186,20 @@ class MarketScanner:
         data = await self.state.get_candles(symbol, timeframe, limit=1)
         return data[-1] if data else None
 
-    async def _collect_signals(self, signals: List) -> None:
-        if not signals:
-            return
-        # Batch add all historical signals (single lock)
-        if len(signals) > 1:
-            await self.state.add_recent_signals_batch(signals[:-1])
-        # Last signal: add + broadcast if new
-        latest = signals[-1]
-        added = await self.state.add_recent_signal_if_new(latest)
-        if added:
-            await self.ws_manager.broadcast_signal(latest)
-            await self.webhook_sender.send_signal(latest)
+    async def _collect_signals(self, signals_by_tf: dict) -> None:
+        """
+        signals_by_tf: {"1m": [...], "3m": [...], ...}
+        For each timeframe, add only the latest signal to recent_signals.
+        Broadcast + webhook if it's genuinely new.
+        """
+        for tf, signals in signals_by_tf.items():
+            if not signals:
+                continue
+            latest = signals[-1]
+            added = await self.state.add_recent_signal_if_new(latest)
+            if added:
+                await self.ws_manager.broadcast_signal(latest)
+                await self.webhook_sender.send_signal(latest)
 
     # Public helpers
     async def scan_once(self) -> None:
