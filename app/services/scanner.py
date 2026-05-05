@@ -137,6 +137,7 @@ class MarketScanner:
 
             # 4) 1m signals
             signals_1m = self.engine.calculate_signals(symbol, "1m", merged_1m)
+            await self.state.set_signals_for_symbol_tf(symbol, "1m", signals_1m)
 
             # 5) Derive higher timeframes — batch all updates
             derived_updates: List[Tuple[str, List[Candle], List[Signal]]] = []
