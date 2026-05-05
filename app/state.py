@@ -87,6 +87,18 @@ class MarketState:
 
             return True
 
+    async def remove_recent_signals(self, ids_to_remove: set) -> None:
+        """Remove signals that no longer exist after recalculation."""
+        if not ids_to_remove:
+            return
+        async with self.lock:
+            self.recent_signals = deque(
+                (s for s in self.recent_signals if s.id not in ids_to_remove),
+                maxlen=self.recent_signals.maxlen,
+            )
+            for sid in ids_to_remove:
+                self._emitted_signal_id_set.discard(sid)
+
     async def add_recent_signals_batch(self, signals: List[Signal]) -> None:
         """Add multiple signals at once with a single lock acquisition."""
         async with self.lock:

@@ -135,11 +135,18 @@ class MarketScanner:
             prev_last_1m = await self._get_last_candle(symbol, "1m")
             merged_1m = await self.state.merge_candles(symbol, "1m", new_candles)
 
-            # 4) 1m signals
+            # 4) Get previous signal IDs (before recalculation)
+            prev_signal_ids: set = set()
+            for tf in ["1m"] + list(DERIVED_TIMEFRAMES):
+                prev_sigs = await self.state.get_signals(symbol, tf)
+                for s in prev_sigs:
+                    prev_signal_ids.add(s.id)
+
+            # 5) 1m signals
             signals_1m = self.engine.calculate_signals(symbol, "1m", merged_1m)
             await self.state.set_signals_for_symbol_tf(symbol, "1m", signals_1m)
 
-            # 5) Derive higher timeframes — batch all updates
+            # 6) Derive higher timeframes — batch all updates
             derived_updates: List[Tuple[str, List[Candle], List[Signal]]] = []
             broadcast_candles: List[Tuple[str, Candle, Optional[Candle]]] = []
             signals_by_tf: dict = {"1m": signals_1m}
@@ -179,6 +186,15 @@ class MarketScanner:
 
             # 9) Collect all signals — batch add + broadcast newest per tf
             await self._collect_signals(signals_by_tf)
+
+            # 10) Remove signals that disappeared after recalculation
+            new_signal_ids: set = set()
+            for sigs in signals_by_tf.values():
+                for s in sigs:
+                    new_signal_ids.add(s.id)
+            disappeared = prev_signal_ids - new_signal_ids
+            if disappeared:
+                await self.state.remove_recent_signals(disappeared)
 
         except Exception as e:
             await self.state.add_error(f"{symbol}: {type(e).__name__}: {e}")
