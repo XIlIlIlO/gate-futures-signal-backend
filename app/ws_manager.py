@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import defaultdict
-from typing import Dict, Set, Tuple
+from typing import Dict, List, Set, Tuple
 
 from fastapi import WebSocket
 
@@ -14,6 +14,8 @@ class WebSocketManager:
         self._lock = asyncio.Lock()
         self.signal_clients: Set[WebSocket] = set()
         self.candle_clients: Dict[Tuple[str, str], Set[WebSocket]] = defaultdict(set)
+        # Track dead clients for deferred cleanup
+        self._dead: List[WebSocket] = []
 
     async def add_signal_client(self, websocket: WebSocket) -> None:
         async with self._lock:
@@ -37,13 +39,14 @@ class WebSocketManager:
         payload = {"event": "signal", "data": signal.model_dump()}
         async with self._lock:
             clients = list(self.signal_clients)
-            # Also notify candle clients watching this symbol/timeframe
             candle_watchers = list(
                 self.candle_clients.get((signal.symbol, signal.timeframe), set())
             )
 
-        await self._safe_broadcast(clients, payload)
-        await self._safe_broadcast(candle_watchers, payload)
+        # Broadcast without lock held
+        self._send_all(clients, payload)
+        self._send_all(candle_watchers, payload)
+        await self._flush_dead()
 
     async def broadcast_candle(self, symbol: str, timeframe: str, candle: Candle) -> None:
         payload = {
@@ -55,22 +58,26 @@ class WebSocketManager:
         async with self._lock:
             clients = list(self.candle_clients.get((symbol, timeframe), set()))
 
-        await self._safe_broadcast(clients, payload)
+        self._send_all(clients, payload)
+        await self._flush_dead()
 
-    async def _safe_broadcast(self, clients: list[WebSocket], payload: dict) -> None:
-        if not clients:
-            return
-
-        dead_clients: list[WebSocket] = []
+    def _send_all(self, clients: List[WebSocket], payload: dict) -> None:
+        """Non-async fire-and-forget send. Dead clients collected for deferred cleanup."""
         for ws in clients:
             try:
-                await ws.send_json(payload)
+                # WebSocket.send_json is sync internally in Starlette when using uvicorn
+                asyncio.ensure_future(ws.send_json(payload))
             except Exception:
-                dead_clients.append(ws)
+                self._dead.append(ws)
 
-        if dead_clients:
-            async with self._lock:
-                for ws in dead_clients:
-                    self.signal_clients.discard(ws)
-                    for group in self.candle_clients.values():
-                        group.discard(ws)
+    async def _flush_dead(self) -> None:
+        """Remove dead clients in batch — single lock acquisition."""
+        if not self._dead:
+            return
+        dead = self._dead
+        self._dead = []
+        async with self._lock:
+            for ws in dead:
+                self.signal_clients.discard(ws)
+                for group in self.candle_clients.values():
+                    group.discard(ws)

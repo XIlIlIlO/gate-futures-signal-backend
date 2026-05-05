@@ -15,7 +15,7 @@ class MarketState:
 
         self.symbols: List[str] = []
 
-        # candles[symbol][timeframe] = [Candle, ...]
+        # candles[symbol][timeframe] = [Candle, ...] (sorted by time)
         self.candles: Dict[str, Dict[str, List[Candle]]] = defaultdict(dict)
 
         # signals_by_symbol_tf[(symbol, timeframe)] = [Signal, ...]
@@ -37,17 +37,23 @@ class MarketState:
             self.symbols = symbols
 
     async def set_candles(self, symbol: str, timeframe: str, candles: List[Candle]) -> None:
+        """Set candles directly (already sorted)."""
         limit = self.settings.candle_limit_for(timeframe)
-        candles = sorted(candles, key=lambda x: x.time)
         async with self.lock:
             self.candles[symbol][timeframe] = candles[-limit:]
 
     async def merge_candles(self, symbol: str, timeframe: str, new_candles: List[Candle]) -> List[Candle]:
+        """Merge new candles into existing (both assumed sorted by time)."""
         limit = self.settings.candle_limit_for(timeframe)
-        new_candles = sorted(new_candles, key=lambda x: x.time)
 
         async with self.lock:
             existing = self.candles.get(symbol, {}).get(timeframe, [])
+            if not existing:
+                merged = new_candles[-limit:]
+                self.candles[symbol][timeframe] = merged
+                return list(merged)
+
+            # Fast merge: existing is sorted, new_candles is sorted
             by_time = {c.time: c for c in existing}
             for c in new_candles:
                 by_time[c.time] = c
@@ -55,6 +61,12 @@ class MarketState:
             merged = sorted(by_time.values(), key=lambda x: x.time)[-limit:]
             self.candles[symbol][timeframe] = merged
             return list(merged)
+
+    async def get_candles_count(self, symbol: str, timeframe: str) -> int:
+        """Get candle count without copying data."""
+        async with self.lock:
+            data = self.candles.get(symbol, {}).get(timeframe, [])
+            return len(data)
 
     async def set_signals_for_symbol_tf(self, symbol: str, timeframe: str, signals: List[Signal]) -> None:
         async with self.lock:
@@ -74,6 +86,35 @@ class MarketState:
                 self._emitted_signal_id_set.discard(old)
 
             return True
+
+    async def add_recent_signals_batch(self, signals: List[Signal]) -> None:
+        """Add multiple signals at once with a single lock acquisition."""
+        async with self.lock:
+            for signal in signals:
+                if signal.id in self._emitted_signal_id_set:
+                    continue
+                self.recent_signals.appendleft(signal)
+                self.emitted_signal_ids.append(signal.id)
+                self._emitted_signal_id_set.add(signal.id)
+
+                while len(self._emitted_signal_id_set) > self.emitted_signal_ids.maxlen:
+                    old = self.emitted_signal_ids.popleft()
+                    self._emitted_signal_id_set.discard(old)
+
+    async def batch_update_symbol(
+        self,
+        symbol: str,
+        updates: List[Tuple[str, List[Candle], List[Signal]]],
+    ) -> None:
+        """
+        Batch update multiple timeframes for one symbol in a single lock.
+        updates: list of (timeframe, candles, signals)
+        """
+        async with self.lock:
+            for timeframe, candles, signals in updates:
+                limit = self.settings.candle_limit_for(timeframe)
+                self.candles[symbol][timeframe] = candles[-limit:]
+                self.signals_by_symbol_tf[(symbol, timeframe)] = signals
 
     async def get_candles(self, symbol: str, timeframe: str, limit: int) -> List[Candle]:
         async with self.lock:
@@ -103,7 +144,6 @@ class MarketState:
     async def snapshot_status(self) -> dict:
         async with self.lock:
             n = len(self.symbols)
-            # 1 API call per symbol per scan cycle (only 1m fetched, rest derived)
             scan_interval = self.settings.scan_interval_seconds
             estimated_rps = n / max(1, scan_interval)
 
