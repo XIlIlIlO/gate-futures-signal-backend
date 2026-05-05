@@ -19,7 +19,7 @@ async def ws_signals(websocket: WebSocket):
     await manager.add_signal_client(websocket)
 
     try:
-        recent = await state.get_recent_signals(timeframe="all", limit=100)
+        recent = await state.get_recent_signals(timeframe="all", limit=500)
         await websocket.send_json({
             "event": "snapshot",
             "market": "gate_usdt_perpetual_futures",
