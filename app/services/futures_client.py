@@ -22,6 +22,8 @@ class GateFuturesClient:
             timeout=httpx.Timeout(float(settings.request_timeout_seconds), connect=10.0),
             headers={"Accept": "application/json"},
         )
+        # symbol → quanto_multiplier (filled on list_symbols)
+        self.multipliers: Dict[str, float] = {}
 
     async def close(self) -> None:
         await self.client.aclose()
@@ -46,6 +48,12 @@ class GateFuturesClient:
 
             symbols.append(name)
 
+            # Store quanto_multiplier for volume conversion
+            try:
+                self.multipliers[name] = float(c.get("quanto_multiplier", 1))
+            except (ValueError, TypeError):
+                self.multipliers[name] = 1.0
+
         symbols = sorted(set(symbols))
 
         if self.settings.use_top_volume:
@@ -57,7 +65,6 @@ class GateFuturesClient:
         return symbols
 
     async def fetch_candles(self, symbol: str, timeframe: str, limit: int) -> List[Candle]:
-        # Gate futures candlesticks: max 2000 points per query.
         safe_limit = max(1, min(int(limit), 2000))
 
         raw = await self._get_json(
@@ -69,9 +76,11 @@ class GateFuturesClient:
             },
         )
 
+        multiplier = self.multipliers.get(symbol, 1.0)
+
         candles: List[Candle] = []
         for item in raw:
-            candle = self._parse_futures_candle(item)
+            candle = self._parse_futures_candle(item, multiplier)
             if candle:
                 candles.append(candle)
 
@@ -163,9 +172,7 @@ class GateFuturesClient:
 
         raise last_error or RuntimeError("Gate request failed")
 
-    def _parse_futures_candle(self, item: Any) -> Optional[Candle]:
-        # FuturesCandlestick model fields:
-        # t: timestamp, v: contract size volume, c/h/l/o prices, sum: quote volume
+    def _parse_futures_candle(self, item: Any, multiplier: float = 1.0) -> Optional[Candle]:
         try:
             if isinstance(item, dict):
                 quote_volume = item.get("sum", None)
@@ -174,6 +181,9 @@ class GateFuturesClient:
                 if quote_volume is None:
                     quote_volume = contract_volume
 
+                # contract_volume × multiplier = coin quantity
+                coin_volume = float(contract_volume or 0) * multiplier
+
                 return Candle(
                     time=int(float(item["t"])),
                     open=float(item["o"]),
@@ -181,11 +191,11 @@ class GateFuturesClient:
                     low=float(item["l"]),
                     close=float(item["c"]),
                     volume=float(quote_volume or 0),
-                    contract_volume=float(contract_volume or 0),
+                    contract_volume=coin_volume,
                 )
 
-            # 방어용: 혹시 배열 형태로 내려오는 환경 대응
             if isinstance(item, list) and len(item) >= 6:
+                coin_volume = float(item[1] or 0) * multiplier
                 return Candle(
                     time=int(float(item[0])),
                     volume=float(item[1] or 0),
@@ -193,7 +203,7 @@ class GateFuturesClient:
                     high=float(item[3]),
                     low=float(item[4]),
                     open=float(item[5]),
-                    contract_volume=float(item[1] or 0),
+                    contract_volume=coin_volume,
                 )
 
         except Exception:
